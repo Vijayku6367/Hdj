@@ -1,7 +1,6 @@
 /** @type {import('next').NextConfig} */
 const nextConfig = {
   reactStrictMode: true,
-  // Vercel serverless functions already handle CORS, but we add custom headers anyway
   async headers() {
     return [
       {
