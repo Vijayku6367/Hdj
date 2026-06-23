@@ -28,7 +28,7 @@ export default function Home() {
 
   return (
     <div style={{ padding: 20, fontFamily: 'Arial' }}>
-      <h1>Onion Payment Bypass</h1>
+      <h1>Onion Payment + ID Wall Bypass</h1>
       <form onSubmit={handleBypass}>
         <input
           type="text"
